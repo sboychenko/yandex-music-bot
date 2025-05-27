@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 # List of allowed user IDs from .env
 ALLOWED_USERS = [int(id.strip()) for id in os.getenv('ALLOWED_USERS', '').split(',') if id.strip()]
+ADMIN_ID = os.getenv('ADMIN_ID')
 
 def is_user_allowed(user_id: int) -> bool:
     """Check if user is allowed to use the bot."""
@@ -28,6 +29,20 @@ yandex_client_with_token = Client(token=os.getenv('YANDEX_MUSIC_TOKEN')).init()
 yandex_client_empty = Client().init()
 #logger.info(os.getenv('TELEGRAM_BOT_TOKEN'))
 
+async def send_admin_notification(application: Application, message: str):
+    """Send notification to admin."""
+    if not ADMIN_ID:
+        return
+    
+    try:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=message,
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error(f"Failed to send admin notification: {e}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
     user = update.effective_user
@@ -35,6 +50,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f'Привет, {user.first_name}! Я бот для скачивания музыки из Яндекс.Музыки.\n'
         'Отправь мне название песни или ссылку на трек.'
     )
+    
+    # Отправляем уведомление администратору о новом пользователе
+    if user.id != int(ADMIN_ID):
+        await send_admin_notification(
+            context.application,
+            f"👤 Новый пользователь запустил бота:\n"
+            f"ID: {user.id}\n"
+            f"Имя: {user.first_name}\n"
+            f"Username: @{user.username if user.username else 'Нет'}"
+        )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /help is issued."""
@@ -44,7 +69,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '/start - Начать работу с ботом\n'
         '/help - Показать это сообщение\n'
         '/myid - Показать ваш Telegram ID\n\n'
-        'Просто отправьте мне название песни или ссылку на трек в Яндекс.Музыке.'
+        'Просто отправьте мне название песни или ссылку на трек в Яндекс.Музыке.\n\n'
+        'Автор: @sboychenko_life'
     )
 
 async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,6 +269,9 @@ async def main():
     application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Отправляем уведомление администратору о запуске бота
+    await send_admin_notification(application, "🚀 Бот успешно запущен!")
 
     # Start the Bot
     await application.run_polling(allowed_updates=Update.ALL_TYPES)
