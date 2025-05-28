@@ -1,6 +1,6 @@
 # Yandex Music Telegram Bot
 
-![Screen](screen.jpg)
+![Screen](screenshot.png)
 
 Telegram бот для скачивания музыки из Яндекс.Музыки.
 
