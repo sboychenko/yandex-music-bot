@@ -129,8 +129,17 @@ async def process_track(client: Client, track_id: str, message):
             await message.reply_text("❌ Не найдена подходящая версия трека")
             return
         
-        # Download track
-        filename = f"{track_id}.mp3"
+        # Create filename in format "Artist - Title - Duration.mp3"
+        duration_min = track.duration_ms // 60000
+        duration_sec = (track.duration_ms % 60000) // 1000
+        duration_str = f"{duration_min}.{duration_sec:02d}"
+        
+        # Clean filename characters that might cause issues
+        safe_artists = "".join(c for c in artists if c.isalnum() or c in " -_").strip()
+        safe_title = "".join(c for c in track.title if c.isalnum() or c in " -_").strip()
+        
+        filename = f"{safe_artists} - {safe_title} ({duration_str}).mp3"
+        
         try:
             track.download(
                 filename,
