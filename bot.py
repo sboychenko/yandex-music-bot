@@ -1,10 +1,11 @@
+import io
 import os
 import logging
 import asyncio
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from yandex_music import Client
+from yandex_music import ClientAsync
 
 # Load environment variables
 load_dotenv()
@@ -19,21 +20,22 @@ logger = logging.getLogger(__name__)
 # List of allowed user IDs from .env
 ALLOWED_USERS = [int(id.strip()) for id in os.getenv('ALLOWED_USERS', '').split(',') if id.strip()]
 ADMIN_ID = os.getenv('ADMIN_ID')
+ADMIN_ID_INT = int(ADMIN_ID) if ADMIN_ID else None
 
 def is_user_allowed(user_id: int) -> bool:
     """Check if user is allowed to use the bot."""
     return len(ALLOWED_USERS) == 0 or user_id in ALLOWED_USERS
 
-# Initialize Yandex Music client
-yandex_client_with_token = Client(token=os.getenv('YANDEX_MUSIC_TOKEN')).init()
-yandex_client_empty = Client().init()
-#logger.info(os.getenv('TELEGRAM_BOT_TOKEN'))
+# Yandex Music clients are created during application startup (see post_init),
+# because ClientAsync.init() is itself a coroutine.
+yandex_client_with_token: ClientAsync = None
+yandex_client_empty: ClientAsync = None
 
 async def send_admin_notification(application: Application, message: str):
     """Send notification to admin."""
     if not ADMIN_ID:
         return
-    
+
     try:
         await application.bot.send_message(
             chat_id=ADMIN_ID,
@@ -50,9 +52,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f'Привет, {user.first_name}! Я бот для скачивания музыки из Яндекс.Музыки.\n'
         'Отправь мне название песни или ссылку на трек.'
     )
-    
+
     # Отправляем уведомление администратору о новом пользователе
-    if user.id != int(ADMIN_ID):
+    if ADMIN_ID_INT is None or user.id != ADMIN_ID_INT:
         await send_admin_notification(
             context.application,
             f"👤 Новый пользователь запустил бота:\n"
@@ -82,13 +84,13 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-async def search_tracks(clinet: Client, query: str, limit: int = 6):
+async def search_tracks(client: ClientAsync, query: str, limit: int = 6):
     """Search for tracks in Yandex Music."""
     try:
-        search_result = clinet.search(query, type_='track')
+        search_result = await client.search(query, type_='track')
         if not search_result.tracks:
             return None
-        
+
         tracks = []
         for track in search_result.tracks.results[:limit]:
             track_info = {
@@ -104,66 +106,65 @@ async def search_tracks(clinet: Client, query: str, limit: int = 6):
         logger.error(f"Error searching tracks: {e}")
         return None
 
-async def process_track(client: Client, track_id: str, message):
+async def process_track(client: ClientAsync, track_id: str, message):
     """Process track download and sending."""
     try:
         # Get track info
-        track = client.tracks(track_id)[0]
+        track = (await client.tracks(track_id))[0]
         artists = ', '.join(artist.name for artist in track.artists)
-        album = track.albums[0].title if track.albums else 'Unknown Album'
-        
+
         # Get download info
-        download_info = track.get_download_info()
+        download_info = await track.get_download_info_async()
         if not download_info:
             await message.reply_text("❌ Трек недоступен для скачивания")
             return
-        
+
         # Get the best available quality
         best_quality = None
         for info in download_info:
             if info.codec == 'mp3':
                 if not best_quality or info.bitrate_in_kbps > best_quality.bitrate_in_kbps:
                     best_quality = info
-        
+
         if not best_quality:
             await message.reply_text("❌ Не найдена подходящая версия трека")
             return
-        
+
         # Create filename in format "Artist - Title - Duration.mp3"
         duration_min = track.duration_ms // 60000
         duration_sec = (track.duration_ms % 60000) // 1000
         duration_str = f"{duration_min}.{duration_sec:02d}"
-        
+
         # Clean filename characters that might cause issues
         safe_artists = "".join(c for c in artists if c.isalnum() or c in " -_").strip()
         safe_title = "".join(c for c in track.title if c.isalnum() or c in " -_").strip()
-        
+
         filename = f"{safe_artists} - {safe_title} ({duration_str}).mp3"
-        
+
         try:
-            track.download(
-                filename,
+            audio_bytes = await track.download_bytes_async(
                 codec=best_quality.codec,
                 bitrate_in_kbps=best_quality.bitrate_in_kbps
             )
-            
+
             # Send audio file with retries
             max_retries = 3
             retry_delay = 2  # seconds
-            
+
             for attempt in range(max_retries):
                 try:
-                    with open(filename, 'rb') as audio:
-                        await message.reply_audio(
-                            audio=audio,
-                            title=track.title,
-                            performer=artists,
-                            caption=f"🎵 {track.title}\n👤 {artists}",
-                            read_timeout=30,
-                            write_timeout=30,
-                            connect_timeout=30,
-                            pool_timeout=30
-                        )
+                    audio_buffer = io.BytesIO(audio_bytes)
+                    audio_buffer.name = filename
+                    await message.reply_audio(
+                        audio=audio_buffer,
+                        title=track.title,
+                        performer=artists,
+                        caption=f"🎵 {track.title}\n👤 {artists}",
+                        read_timeout=30,
+                        write_timeout=30,
+                        connect_timeout=30,
+                        pool_timeout=30
+                    )
                     break  # If successful, break the retry loop
                 except Exception as e:
                     if attempt < max_retries - 1:  # If not the last attempt
@@ -172,16 +173,11 @@ async def process_track(client: Client, track_id: str, message):
                         retry_delay *= 2  # Exponential backoff
                     else:
                         raise  # Re-raise the last exception if all attempts failed
-            
-            # Clean up
-            os.remove(filename)
-            
+
         except Exception as e:
             logger.error(f"Error during download/send: {e}")
             await message.reply_text("❌ Произошла ошибка при скачивании или отправке трека")
-            if os.path.exists(filename):
-                os.remove(filename)
-                
+
     except Exception as e:
         logger.error(f"Error processing track: {e}")
         await message.reply_text("❌ Произошла ошибка при обработке трека")
@@ -189,42 +185,43 @@ async def process_track(client: Client, track_id: str, message):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming messages."""
     text = update.message.text
-    
+
     # Allow /myid command for all users
     if text == '/myid':
         await myid_command(update, context)
-        return 
-    
+        return
+
     # Check access for other commands and messages
     yandex_client = yandex_client_empty if not is_user_allowed(update.effective_user.id) else yandex_client_with_token
-    
+
     if 'music.yandex' in text:
         # Handle Yandex Music URL
         await update.message.reply_text("🎵 Подготовка трека к скачиванию...")
-        
+
         try:
             # Remove query parameters from URL
             text = text.split('?')[0]
-            
+
             # Extract track ID from URL
             if '/track/' in text:
                 track_id = text.split('/track/')[1].split('/')[0]
-            elif '/album/' in text:
-                track_id = text.split('/track/')[1].split('/')[0]
             else:
-                await update.message.reply_text("❌ Неподдерживаемый формат ссылки")
+                await update.message.reply_text(
+                    "❌ Неподдерживаемый формат ссылки. Отправьте ссылку на конкретный трек, "
+                    "а не на альбом или плейлист целиком."
+                )
                 return
 
             await process_track(yandex_client, track_id, update.message)
-                    
+
         except Exception as e:
             logger.error(f"Error processing URL: {e}")
             await update.message.reply_text("❌ Не удалось обработать ссылку")
-            
+
     else:
         # Handle search query
         await update.message.reply_text(f"🔍 Ищу трек: {text}")
-        
+
         tracks = await search_tracks(yandex_client, text)
         if not tracks:
             await update.message.reply_text(
@@ -232,7 +229,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Попробуйте изменить поисковый запрос."
             )
             return
-        
+
         # Create inline keyboard with search results
         keyboard = []
         for track in tracks:
@@ -243,7 +240,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(button_text) > 64:
                 button_text = button_text[:61] + "..."
             keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-        
+
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
             "🎵 Выберите трек для скачивания:",
@@ -257,20 +254,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check access for other commands and messages
     yandex_client = yandex_client_empty if not is_user_allowed(query.from_user.id) else yandex_client_with_token
-    
+
     if not is_user_allowed(query.from_user.id):
         await query.message.reply_text(
             "🤖 Бот работает в демо режиме, треки в ознакомительном 30сек виде."
         )
-    
+
     if query.data.startswith('track_'):
         track_id = query.data.split('_')[1]
         await query.message.reply_text("🎵 Подготовка трека к скачиванию...")
         await process_track(yandex_client, track_id, query.message)
 
-async def main():
+async def post_init(application: Application):
+    """Runs once after the Application is initialized, before polling starts."""
+    global yandex_client_with_token, yandex_client_empty
+
+    yandex_client_with_token = await ClientAsync(os.getenv('YANDEX_MUSIC_TOKEN')).init()
+    yandex_client_empty = await ClientAsync().init()
+
+    # Отправляем уведомление администратору о запуске бота
+    await send_admin_notification(application, "🚀 Бот успешно запущен!")
+
+def main():
     """Start the bot."""
-    application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
+    application = (
+        Application.builder()
+        .token(os.getenv('TELEGRAM_BOT_TOKEN'))
+        .post_init(post_init)
+        .build()
+    )
 
     # Add handlers
     application.add_handler(CommandHandler("start", start))
@@ -279,26 +291,8 @@ async def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Отправляем уведомление администратору о запуске бота
-    await send_admin_notification(application, "🚀 Бот успешно запущен!")
-
     # Start the Bot
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    try:
-        import nest_asyncio
-        nest_asyncio.apply()
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(main())
-    except KeyboardInterrupt:
-        print("Bot stopped by user")
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        try:
-            loop.close()
-        except Exception as e:
-            print(f"Error closing loop: {e}") 
+    main()

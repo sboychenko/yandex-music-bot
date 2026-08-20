@@ -1,4 +1,3 @@
-python-telegram-bot==21.8
-yandex-music==2.2.0
-python-dotenv==1.0.0
-nest_asyncio==1.6.0 
+python-telegram-bot==22.5
+yandex-music[async]==3.0.0
+python-dotenv==1.2.1 
