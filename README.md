@@ -48,6 +48,24 @@ python bot.py
 - yandex-music
 - python-dotenv
 
+## CI/CD
+
+При пуше в `main` GitHub Actions ([.github/workflows/deploy.yml](.github/workflows/deploy.yml)) собирает Docker-образ,
+пушит его в GitHub Container Registry и разворачивает на VPS по SSH. В pull request'ах и других ветках выполняется
+только проверка сборки, без публикации и деплоя.
+
+Для автодеплоя нужно один раз добавить в **Settings → Secrets and variables → Actions** секреты:
+
+- `REMOTE_HOST` — адрес VPS
+- `REMOTE_USER` — пользователь для SSH
+- `REMOTE_KEY` — приватный SSH-ключ (содержимое файла, не путь)
+
+На сервере в `~/yandex-music-bot/.env` должен лежать файл с `TELEGRAM_BOT_TOKEN`, `YANDEX_MUSIC_TOKEN` и остальными
+переменными — workflow его не создаёт и не перезаписывает, только запускает контейнер с `--env-file`.
+
+Ручной деплой через `deploy.sh` (см. [deploy.md](deploy.md)) продолжает работать и может использоваться как запасной
+вариант.
+
 ## Лицензия
 
 MIT
