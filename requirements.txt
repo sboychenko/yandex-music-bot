@@ -1,3 +1,4 @@
 python-telegram-bot==22.5
 yandex-music[async]==3.0.0
-python-dotenv==1.2.1 
+python-dotenv==1.2.1
+mutagen==1.47.0 

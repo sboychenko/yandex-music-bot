@@ -72,5 +72,6 @@ jobs:
               --name yandex-music-bot \
               --restart unless-stopped \
               --env-file ~/yandex-music-bot/.env \
+              -v ~/yandex-music-bot/data:/app/data \
               "$IMAGE:latest"
             docker image prune -f

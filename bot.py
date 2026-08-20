@@ -1,11 +1,23 @@
+from __future__ import annotations
+
 import io
+import json
 import os
 import logging
 import asyncio
 from dotenv import load_dotenv
+from mutagen.id3 import APIC, TIT2, TPE1
+from mutagen.mp3 import MP3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from yandex_music import ClientAsync
+from yandex_music.exceptions import (
+    BadRequestError,
+    NetworkError,
+    TimedOutError,
+    UnauthorizedError,
+    YandexMusicError,
+)
 
 # Load environment variables
 load_dotenv()
@@ -21,6 +33,12 @@ logger = logging.getLogger(__name__)
 ALLOWED_USERS = [int(id.strip()) for id in os.getenv('ALLOWED_USERS', '').split(',') if id.strip()]
 ADMIN_ID = os.getenv('ADMIN_ID')
 ADMIN_ID_INT = int(ADMIN_ID) if ADMIN_ID else None
+CACHE_FILE_PATH = os.getenv('CACHE_FILE_PATH', 'data/cache.json')
+
+# Errors raised by the yandex-music library itself (network/API/auth issues) —
+# handled separately from bugs in our own code, since they're expected to happen
+# occasionally and deserve a friendlier message instead of a generic failure.
+YANDEX_ERRORS = (YandexMusicError, UnauthorizedError, NetworkError, TimedOutError, BadRequestError)
 
 def is_user_allowed(user_id: int) -> bool:
     """Check if user is allowed to use the bot."""
@@ -30,6 +48,68 @@ def is_user_allowed(user_id: int) -> bool:
 # because ClientAsync.init() is itself a coroutine.
 yandex_client_with_token: ClientAsync = None
 yandex_client_empty: ClientAsync = None
+
+# Caches Telegram file_id per (track_id, is_full) so a previously sent track is
+# resent instantly instead of being re-downloaded from Yandex and re-uploaded.
+# Full and preview versions are cached separately so a demo-mode user can never
+# get a full track (or vice versa) from something cached by the other tier.
+# Kept as a plain JSON file (no database dependency) — the whole cache lives in
+# memory and is written through to disk on every update, so reads never touch
+# the filesystem and writes are serialized with a lock to avoid a corrupt file.
+_file_id_cache: dict[str, str] = {}
+_file_id_cache_lock = asyncio.Lock()
+
+def _cache_key(track_id: str, is_full: bool) -> str:
+    return f"{track_id}:{'full' if is_full else 'preview'}"
+
+def load_file_id_cache():
+    """Load the file_id cache from disk, if present."""
+    global _file_id_cache
+    if not os.path.exists(CACHE_FILE_PATH):
+        return
+
+    try:
+        with open(CACHE_FILE_PATH, 'r', encoding='utf-8') as f:
+            _file_id_cache = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"Failed to load file_id cache, starting fresh: {e}")
+        _file_id_cache = {}
+
+async def get_cached_file_id(track_id: str, is_full: bool) -> str | None:
+    return _file_id_cache.get(_cache_key(track_id, is_full))
+
+async def cache_file_id(track_id: str, is_full: bool, file_id: str):
+    async with _file_id_cache_lock:
+        _file_id_cache[_cache_key(track_id, is_full)] = file_id
+        directory = os.path.dirname(CACHE_FILE_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(CACHE_FILE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(_file_id_cache, f)
+
+def embed_mp3_tags(raw_bytes: bytes, title: str, performer: str, cover_bytes: bytes | None) -> bytes:
+    """Embed title/performer/cover directly into the mp3 so they show up in any player,
+    not just in Telegram's own audio metadata fields. Falls back to the original bytes
+    on any tagging failure — metadata is a nice-to-have, sending the track is not."""
+    try:
+        buffer = io.BytesIO(raw_bytes)
+        audio = MP3(buffer)
+        try:
+            audio.add_tags()
+        except Exception:
+            pass  # tags already present
+
+        audio.tags.add(TIT2(encoding=3, text=title))
+        audio.tags.add(TPE1(encoding=3, text=performer))
+        if cover_bytes:
+            audio.tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes))
+
+        buffer.seek(0)
+        audio.save(buffer)
+        return buffer.getvalue()
+    except Exception as e:
+        logger.warning(f"Failed to embed mp3 tags: {e}")
+        return raw_bytes
 
 async def send_admin_notification(application: Application, message: str):
     """Send notification to admin."""
@@ -86,32 +166,41 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def search_tracks(client: ClientAsync, query: str, limit: int = 6):
     """Search for tracks in Yandex Music."""
-    try:
-        search_result = await client.search(query, type_='track')
-        if not search_result.tracks:
-            return None
-
-        tracks = []
-        for track in search_result.tracks.results[:limit]:
-            track_info = {
-                'id': track.id,
-                'title': track.title,
-                'artists': ', '.join(artist.name for artist in track.artists),
-                'duration': track.duration_ms // 1000,
-                'album': track.albums[0].title if track.albums else 'Unknown Album'
-            }
-            tracks.append(track_info)
-        return tracks
-    except Exception as e:
-        logger.error(f"Error searching tracks: {e}")
+    search_result = await client.search(query, type_='track')
+    if not search_result.tracks:
         return None
 
-async def process_track(client: ClientAsync, track_id: str, message):
+    tracks = []
+    for track in search_result.tracks.results[:limit]:
+        track_info = {
+            'id': track.id,
+            'title': track.title,
+            'artists': ', '.join(artist.name for artist in track.artists),
+            'duration': track.duration_ms // 1000,
+            'album': track.albums[0].title if track.albums else 'Unknown Album'
+        }
+        tracks.append(track_info)
+    return tracks
+
+async def process_track(client: ClientAsync, track_id: str, message, is_full: bool):
     """Process track download and sending."""
     try:
         # Get track info
         track = (await client.tracks(track_id))[0]
         artists = ', '.join(artist.name for artist in track.artists)
+        caption = f"🎵 {track.title}\n👤 {artists}"
+
+        # Serve a previously sent copy straight from cache, skipping the
+        # download/tagging/upload round-trip entirely.
+        cached_file_id = await get_cached_file_id(track_id, is_full)
+        if cached_file_id:
+            await message.reply_audio(
+                audio=cached_file_id,
+                title=track.title,
+                performer=artists,
+                caption=caption,
+            )
+            return
 
         # Get download info
         download_info = await track.get_download_info_async()
@@ -141,45 +230,56 @@ async def process_track(client: ClientAsync, track_id: str, message):
 
         filename = f"{safe_artists} - {safe_title} ({duration_str}).mp3"
 
-        try:
-            audio_bytes = await track.download_bytes_async(
-                codec=best_quality.codec,
-                bitrate_in_kbps=best_quality.bitrate_in_kbps
-            )
+        audio_bytes = await track.download_bytes_async(
+            codec=best_quality.codec,
+            bitrate_in_kbps=best_quality.bitrate_in_kbps
+        )
 
-            # Send audio file with retries
-            max_retries = 3
-            retry_delay = 2  # seconds
+        cover_bytes = None
+        if track.cover_uri:
+            try:
+                cover_bytes = await track.download_cover_bytes_async(size="300x300")
+            except Exception as e:
+                logger.warning(f"Failed to download cover for track {track_id}: {e}")
 
-            for attempt in range(max_retries):
-                try:
-                    audio_buffer = io.BytesIO(audio_bytes)
-                    audio_buffer.name = filename
-                    await message.reply_audio(
-                        audio=audio_buffer,
-                        title=track.title,
-                        performer=artists,
-                        caption=f"🎵 {track.title}\n👤 {artists}",
-                        read_timeout=30,
-                        write_timeout=30,
-                        connect_timeout=30,
-                        pool_timeout=30
-                    )
-                    break  # If successful, break the retry loop
-                except Exception as e:
-                    if attempt < max_retries - 1:  # If not the last attempt
-                        logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {retry_delay} seconds...")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
-                    else:
-                        raise  # Re-raise the last exception if all attempts failed
+        audio_bytes = embed_mp3_tags(audio_bytes, track.title, artists, cover_bytes)
 
-        except Exception as e:
-            logger.error(f"Error during download/send: {e}")
-            await message.reply_text("❌ Произошла ошибка при скачивании или отправке трека")
+        # Send audio file with retries
+        max_retries = 3
+        retry_delay = 2  # seconds
+        sent = None
 
+        for attempt in range(max_retries):
+            try:
+                audio_buffer = io.BytesIO(audio_bytes)
+                audio_buffer.name = filename
+                sent = await message.reply_audio(
+                    audio=audio_buffer,
+                    title=track.title,
+                    performer=artists,
+                    caption=caption,
+                    read_timeout=30,
+                    write_timeout=30,
+                    connect_timeout=30,
+                    pool_timeout=30
+                )
+                break  # If successful, break the retry loop
+            except Exception as e:
+                if attempt < max_retries - 1:  # If not the last attempt
+                    logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    raise  # Re-raise the last exception if all attempts failed
+
+        if sent is not None and sent.audio:
+            await cache_file_id(track_id, is_full, sent.audio.file_id)
+
+    except YANDEX_ERRORS as e:
+        logger.warning(f"Yandex Music error while processing track {track_id}: {e}")
+        await message.reply_text("⚠️ Яндекс.Музыка сейчас недоступна, попробуйте чуть позже")
     except Exception as e:
-        logger.error(f"Error processing track: {e}")
+        logger.error(f"Error processing track {track_id}: {e}")
         await message.reply_text("❌ Произошла ошибка при обработке трека")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -193,36 +293,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check access for other commands and messages
     yandex_client = yandex_client_empty if not is_user_allowed(update.effective_user.id) else yandex_client_with_token
+    is_full = yandex_client is yandex_client_with_token
 
     if 'music.yandex' in text:
         # Handle Yandex Music URL
         await update.message.reply_text("🎵 Подготовка трека к скачиванию...")
 
-        try:
-            # Remove query parameters from URL
-            text = text.split('?')[0]
+        # Remove query parameters from URL
+        text = text.split('?')[0]
 
-            # Extract track ID from URL
-            if '/track/' in text:
-                track_id = text.split('/track/')[1].split('/')[0]
-            else:
-                await update.message.reply_text(
-                    "❌ Неподдерживаемый формат ссылки. Отправьте ссылку на конкретный трек, "
-                    "а не на альбом или плейлист целиком."
-                )
-                return
+        # Extract track ID from URL
+        if '/track/' in text:
+            track_id = text.split('/track/')[1].split('/')[0]
+        else:
+            await update.message.reply_text(
+                "❌ Неподдерживаемый формат ссылки. Отправьте ссылку на конкретный трек, "
+                "а не на альбом или плейлист целиком."
+            )
+            return
 
-            await process_track(yandex_client, track_id, update.message)
-
-        except Exception as e:
-            logger.error(f"Error processing URL: {e}")
-            await update.message.reply_text("❌ Не удалось обработать ссылку")
+        await process_track(yandex_client, track_id, update.message, is_full)
 
     else:
         # Handle search query
         await update.message.reply_text(f"🔍 Ищу трек: {text}")
 
-        tracks = await search_tracks(yandex_client, text)
+        try:
+            tracks = await search_tracks(yandex_client, text)
+        except YANDEX_ERRORS as e:
+            logger.warning(f"Yandex Music error while searching '{text}': {e}")
+            await update.message.reply_text("⚠️ Яндекс.Музыка сейчас недоступна, попробуйте чуть позже")
+            return
+        except Exception as e:
+            logger.error(f"Unexpected error while searching '{text}': {e}")
+            await update.message.reply_text("❌ Произошла непредвиденная ошибка при поиске")
+            return
+
         if not tracks:
             await update.message.reply_text(
                 "😔 К сожалению, я не смог найти треки по вашему запросу. "
@@ -254,6 +360,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check access for other commands and messages
     yandex_client = yandex_client_empty if not is_user_allowed(query.from_user.id) else yandex_client_with_token
+    is_full = yandex_client is yandex_client_with_token
 
     if not is_user_allowed(query.from_user.id):
         await query.message.reply_text(
@@ -263,7 +370,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith('track_'):
         track_id = query.data.split('_')[1]
         await query.message.reply_text("🎵 Подготовка трека к скачиванию...")
-        await process_track(yandex_client, track_id, query.message)
+        await process_track(yandex_client, track_id, query.message, is_full)
 
 async def post_init(application: Application):
     """Runs once after the Application is initialized, before polling starts."""
@@ -271,6 +378,7 @@ async def post_init(application: Application):
 
     yandex_client_with_token = await ClientAsync(os.getenv('YANDEX_MUSIC_TOKEN')).init()
     yandex_client_empty = await ClientAsync().init()
+    load_file_id_cache()
 
     # Отправляем уведомление администратору о запуске бота
     await send_admin_notification(application, "🚀 Бот успешно запущен!")
